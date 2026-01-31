@@ -53,7 +53,70 @@ htmlcov/
 *.tmp
 *.temp
 
-# Data files (user data should not be committed)
+# User data (should not be committed)
+*.json
+!requirements.txt
+!pyproject.toml
+!setup.py
+!
+E0F
+cat > .gitignore << 'EOF'
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+env/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project specific
+.capsulenet/
+*.log
+*.sqlite
+*.sqlite3
+
+# Test coverage
+.coverage
+htmlcov/
+
+# Jupyter
+.ipynb_checkpoints
+
+# Temp files
+*.tmp
+*.temp
+
+# User data (should not be committed)
 *.json
 !requirements.txt
 !pyproject.toml
@@ -61,3 +124,7 @@ htmlcov/
 !VERSION
 !CHANGELOG.md
 !README.md
+!pytest.ini
+
+# Test files (keep in repo)
+!tests/

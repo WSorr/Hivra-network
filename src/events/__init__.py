@@ -1,9 +1,7 @@
 """
-Event system - simple version.
+Event system for Hivra CapsuleNet V1.
 """
-from src.events.base_simple import SimpleEvent, create_invitation
-
-Event = SimpleEvent
-create_invitation_event = create_invitation
+from src.events.base import Event
+from src.events.factories import create_invitation_event
 
 __all__ = ['Event', 'create_invitation_event']
