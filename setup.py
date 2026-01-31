@@ -1,11 +1,16 @@
 from setuptools import setup, find_packages
 
 setup(
-    name="hivra-network",
+    name="hivra-capsulenet",
     version="0.1.0",
-    description="Event-driven modular network protocol",
-    author="Hivra Network",
     packages=find_packages(),
     install_requires=[],
+    entry_points={
+        'console_scripts': [
+            'capsulenet=cli:main',
+        ],
+    },
+    author="Hivra Network",
+    description="Distributed capsule architecture for trusted connections",
     python_requires=">=3.8",
 )

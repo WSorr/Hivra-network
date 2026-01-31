@@ -1,323 +1,500 @@
 #!/usr/bin/env python3
 """
-Hivra Network CLI
-Event-driven, modular architecture
+Hivra CapsuleNet CLI - Stateful version.
 """
-import sys
+import argparse
 import json
-import uuid
-import readline  # For command history
-from typing import Dict, Optional, List
-from src.core.capsule import Capsule, CapsuleType
-from src.core.starter import Starter
-from src.coordinator.event_bus import EventBus
-from src.modules.invitation import InvitationModule
-from src.modules.trust import TrustModule
-from src.events.base import *
+import sys
+from pathlib import Path
+from typing import Optional, List, Dict, Any
+from datetime import datetime
 
-class HistoryCompleter:
-    """Simple autocompleter for CLI"""
-    def __init__(self, commands: List[str]):
-        self.commands = commands
-        self.matches = []
+from src.core.capsule import Capsule, CapsuleType
+from src.core.ledger import Ledger
+from src.core.state import State
+from src.events import Event, create_invitation_event
+
+
+class CapsuleManager:
+    """Manages capsules with state persistence."""
     
-    def complete(self, text: str, state: int) -> Optional[str]:
-        if state == 0:
-            if text:
-                self.matches = [c for c in self.commands if c.startswith(text)]
-            else:
-                self.matches = self.commands[:]
+    def __init__(self, data_dir: Path = Path.home() / ".capsulenet"):
+        self.data_dir = data_dir
+        self.data_dir.mkdir(exist_ok=True)
+        self._invitations_file = data_dir / "invitations.json"
+        self._state_file = data_dir / "cli_state.json"
+        self._current_capsule: Optional[str] = None
+    
+    def get_current_capsule_id(self) -> Optional[str]:
+        """Get currently loaded capsule ID."""
+        if self._state_file.exists():
+            try:
+                with open(self._state_file, 'r') as f:
+                    state = json.load(f)
+                return state.get('current_capsule')
+            except:
+                pass
+        return None
+    
+    def set_current_capsule(self, capsule_id: str) -> None:
+        """Set current capsule."""
+        state = {'current_capsule': capsule_id}
+        with open(self._state_file, 'w') as f:
+            json.dump(state, f, indent=2)
+    
+    def clear_current_capsule(self) -> None:
+        """Clear current capsule."""
+        if self._state_file.exists():
+            self._state_file.unlink()
+    
+    def load_capsule(self, capsule_id: str) -> Optional[Dict]:
+        """Load capsule data."""
+        capsule_file = self.data_dir / f"{capsule_id}_capsule.json"
+        if not capsule_file.exists():
+            return None
         
         try:
-            return self.matches[state]
-        except IndexError:
+            with open(capsule_file, 'r') as f:
+                data = json.load(f)
+            return data
+        except:
             return None
+    
+    def save_capsule(self, capsule_id: str, data: Dict) -> None:
+        """Save capsule data."""
+        capsule_file = self.data_dir / f"{capsule_id}_capsule.json"
+        with open(capsule_file, 'w') as f:
+            json.dump(data, f, indent=2)
+    
+    def load_ledger(self, capsule_id: str) -> Ledger:
+        """Load or create ledger."""
+        ledger_file = self.data_dir / f"{capsule_id}_ledger.json"
+        if ledger_file.exists():
+            return Ledger.load_from_file(str(ledger_file))
+        return Ledger(capsule_id)
+    
+    def save_ledger(self, capsule_id: str, ledger: Ledger) -> None:
+        """Save ledger."""
+        ledger_file = self.data_dir / f"{capsule_id}_ledger.json"
+        ledger.save_to_file(str(ledger_file))
+    
+    def load_invitations(self) -> List[Dict]:
+        """Load invitations."""
+        if not self._invitations_file.exists():
+            return []
+        try:
+            with open(self._invitations_file, 'r') as f:
+                return json.load(f)
+        except:
+            return []
+    
+    def save_invitations(self, invitations: List[Dict]) -> None:
+        """Save invitations."""
+        with open(self._invitations_file, 'w') as f:
+            json.dump(invitations, f, indent=2)
+    
+    def list_capsules(self) -> List[Dict]:
+        """List all capsules."""
+        capsules = []
+        for file in self.data_dir.glob("*_capsule.json"):
+            caps_id = file.name.replace("_capsule.json", "")
+            try:
+                with open(file, 'r') as f:
+                    data = json.load(f)
+                caps_type = data.get("capsule_type", "unknown").upper()
+                
+                slots = data.get("slots", {})
+                starter_count = sum(1 for s in slots.values() if s.get("starter_id"))
+                total_slots = len(slots)
+                
+                capsules.append({
+                    'id': caps_id,
+                    'type': caps_type,
+                    'starters': f"{starter_count}/{total_slots}",
+                    'is_genesis': caps_type == "GENESIS"
+                })
+            except:
+                capsules.append({
+                    'id': caps_id,
+                    'type': "ERROR",
+                    'starters': "?/?",
+                    'is_genesis': False
+                })
+        return capsules
 
-class CapsuleSystem:
-    """Core system managing capsules and events"""
+
+def create_capsule(capsule_type: str, capsule_id: str, manager: CapsuleManager) -> None:
+    """Create new capsule."""
+    try:
+        caps_type = CapsuleType(capsule_type.lower())
+    except ValueError:
+        print(f"Error: Use 'genesis' or 'proto'")
+        return
     
-    def __init__(self):
-        self.capsules: Dict[str, Capsule] = {}
-        self.bus = EventBus()
+    capsule = Capsule(capsule_id=capsule_id, capsule_type=caps_type)
+    manager.save_capsule(capsule_id, capsule.to_dict())
+    manager.set_current_capsule(capsule_id)
     
-    def create_capsule(self, capsule_id: str, capsule_type: CapsuleType = CapsuleType.PROTO) -> Capsule:
-        """Create new capsule"""
-        capsule = Capsule(id=capsule_id, capsule_type=capsule_type)
-        self.capsules[capsule_id] = capsule
-        
-        # Create modules for this capsule
-        inv_module = InvitationModule(capsule)
-        trust_module = TrustModule(capsule)
-        
-        # Subscribe modules to events
-        self.bus.subscribe(InviteEvent, inv_module.handle_event)
-        self.bus.subscribe(UserActionEvent, inv_module.handle_event)
-        self.bus.subscribe(UserActionEvent, trust_module.handle_event)
-        self.bus.subscribe(StarterEvent, trust_module.handle_event)
-        
-        return capsule
+    # Create empty ledger
+    ledger = Ledger(capsule_id)
+    manager.save_ledger(capsule_id, ledger)
     
-    def add_starter_to_capsule(self, capsule_id: str, starter_id: Optional[str] = None) -> str:
-        """Add starter to capsule (occupy slot)"""
-        if capsule_id not in self.capsules:
-            raise ValueError(f"Capsule {capsule_id} not found")
-        
-        capsule = self.capsules[capsule_id]
-        empty_slot = capsule.find_empty_slot()
-        
-        if empty_slot is None:
-            raise ValueError(f"Capsule {capsule_id} has no empty slots")
-        
-        if starter_id is None:
-            starter = Starter.generate(capsule_id)
-            starter_id = starter.id
+    print(f"✓ Created {capsule_type.upper()} capsule: {capsule_id}")
+    if caps_type == CapsuleType.GENESIS:
+        print(f"  🎉 All 5 starters created automatically")
+    else:
+        print(f"  ⏳ Empty slots - needs invitation to get starters")
+
+
+def load_capsule(capsule_id: str, manager: CapsuleManager) -> bool:
+    """Load capsule as current."""
+    if not manager.load_capsule(capsule_id):
+        print(f"Error: Capsule '{capsule_id}' not found")
+        return False
+    
+    manager.set_current_capsule(capsule_id)
+    print(f"✓ Loaded capsule: {capsule_id}")
+    show_status(capsule_id, manager)
+    return True
+
+
+def show_status(capsule_id: str, manager: CapsuleManager) -> None:
+    """Show capsule status."""
+    data = manager.load_capsule(capsule_id)
+    if not data:
+        print(f"Error: Capsule '{capsule_id}' not found")
+        return
+    
+    capsule = Capsule.from_dict(data)
+    ledger = manager.load_ledger(capsule_id)
+    invitations = manager.load_invitations()
+    my_invitations = [inv for inv in invitations if inv['recipient'] == capsule_id]
+    
+    print(f"\n{'='*50}")
+    print(f"CAPSULE: {capsule_id}")
+    print(f"TYPE: {capsule.capsule_type.value.upper()}")
+    print(f"{'='*50}")
+    
+    print("\n🧪 STARTER SLOTS:")
+    for slot_name, slot in capsule.slots.items():
+        if slot.starter_id:
+            print(f"  {slot_name:15} ✅ OCCUPIED")
         else:
-            starter = Starter(id=starter_id, owner_capsule_id=capsule_id)
-        
-        capsule.occupy_slot(empty_slot, starter_id)
-        return starter_id
+            print(f"  {slot_name:15} ⭕ EMPTY")
     
-    def send_invite(self, from_id: str, to_id: str, starter_id: str):
-        """Send invitation from one capsule to another"""
-        if from_id not in self.capsules:
-            raise ValueError(f"Source capsule {from_id} not found")
-        if to_id not in self.capsules:
-            raise ValueError(f"Target capsule {to_id} not found")
-        
-        invite = InviteEvent(
-            source=from_id,
-            sender_capsule_id=from_id,
-            target_capsule_id=to_id,
-            sender_starter_id=starter_id
-        )
-        
-        self.bus.publish(invite)
-        return invite
+    if my_invitations:
+        print(f"\n📥 PENDING INVITATIONS: {len(my_invitations)}")
+        for inv in my_invitations[:3]:
+            print(f"  From: {inv['sender']}, Slot: {inv['slot']}")
+        if len(my_invitations) > 3:
+            print(f"  ... and {len(my_invitations) - 3} more")
     
-    def accept_invite(self, capsule_id: str, from_id: str, starter_id: str):
-        """Accept invitation"""
-        if capsule_id not in self.capsules:
-            raise ValueError(f"Capsule {capsule_id} not found")
-        
-        accept = UserActionEvent(
-            source=capsule_id,
-            action_type=UserActionType.ACCEPT_INVITE,
-            target_capsule_id=from_id,
-            invite_sender_id=from_id,
-            invite_starter_id=starter_id
-        )
-        
-        new_events = self.bus.publish(accept)
-        
-        # Process any generated events (like starter generation)
-        for event in new_events:
-            self.bus.publish(event)
-        
-        return new_events
+    print(f"\n📊 Ledger events: {len(ledger.entries)}")
     
-    def toggle_trust(self, capsule_id: str, target_id: str):
-        """Toggle trust relationship"""
-        if capsule_id not in self.capsules:
-            raise ValueError(f"Capsule {capsule_id} not found")
-        
-        toggle = UserActionEvent(
-            source=capsule_id,
-            action_type=UserActionType.TOGGLE_STATE,
-            target_capsule_id=target_id,
-            state_name="trusted"
-        )
-        
-        self.bus.publish(toggle)
-        return toggle
-    
-    def get_status(self, capsule_id: str) -> dict:
-        """Get capsule status"""
-        if capsule_id not in self.capsules:
-            raise ValueError(f"Capsule {capsule_id} not found")
-        
-        capsule = self.capsules[capsule_id]
-        
-        slots_status = []
-        for idx, slot in capsule.slots.items():
-            slots_status.append({
-                "slot": idx,
-                "state": slot.state,
-                "starter_id": slot.starter_id
-            })
-        
-        relationships = {}
-        for other_id, rel in capsule.relationships.items():
-            relationships[other_id] = {
-                "invited": rel.invited,
-                "trusted": rel.trusted,
-                "linked": rel.linked,
-                "ignored": rel.ignored
-            }
-        
-        return {
-            "id": capsule.id,
-            "type": capsule.capsule_type.value,
-            "slots": slots_status,
-            "relationships": relationships
-        }
-    
-    def list_capsules(self) -> List[str]:
-        """List all capsule IDs"""
-        return list(self.capsules.keys())
+    if capsule.capsule_type == CapsuleType.GENESIS:
+        print(f"\n💡 This GENESIS capsule can send invitations")
+        print(f"   Command: cli.py invite <recipient> <slot>")
+    else:
+        print(f"\n💡 This PROTO capsule can accept invitations")
+        print(f"   Command: cli.py accept <invitation-id>")
 
-def print_help():
-    """Print CLI help"""
-    print("""
-Hivra Network CLI
-=================
 
-Commands:
-  help                          Show this help
-  create <id> [type]            Create capsule (types: genesis, proto, linked)
-  status <id>                   Show capsule status
-  add-starter <capsule_id>      Add starter to capsule
-  invite <from> <to> <starter>  Send invitation
-  accept <capsule> <from> <starter> Accept invitation
-  trust <capsule> <target>      Toggle trust relationship
-  list                          List all capsules
-  exit                          Exit CLI
+def list_capsules(manager: CapsuleManager) -> None:
+    """List all capsules."""
+    capsules = manager.list_capsules()
+    
+    if not capsules:
+        print("No capsules found")
+        return
+    
+    print(f"\n📦 CAPSULES:")
+    print("-" * 40)
+    
+    # Sort: genesis first
+    capsules.sort(key=lambda x: (not x['is_genesis'], x['id']))
+    
+    for caps in capsules:
+        type_icon = "👑" if caps['is_genesis'] else "🆕"
+        print(f"  {type_icon} {caps['id']:20} - {caps['type']:8} [{caps['starters']} starters]")
+    
+    current = manager.get_current_capsule_id()
+    if current:
+        print(f"\n💡 Current capsule: {current}")
+    print(f"💡 Load capsule: cli.py load <id>")
 
-Examples:
-  create capsule_a genesis
-  create capsule_b proto
-  add-starter capsule_a
-  invite capsule_a capsule_b starter_123
-  accept capsule_b capsule_a starter_123
-  trust capsule_b capsule_a
-  status capsule_b
-""")
+
+def send_invitation(sender_id: str, recipient_id: str, slot_name: str, manager: CapsuleManager) -> None:
+    """Send invitation from Genesis to Proto."""
+    sender_data = manager.load_capsule(sender_id)
+    if not sender_data:
+        print(f"Error: Sender capsule '{sender_id}' not found")
+        return
+    
+    sender = Capsule.from_dict(sender_data)
+    if sender.capsule_type != CapsuleType.GENESIS:
+        print(f"Error: Only GENESIS capsules can send invitations")
+        return
+    
+    recipient_data = manager.load_capsule(recipient_id)
+    if not recipient_data:
+        print(f"Error: Recipient capsule '{recipient_id}' not found")
+        print(f"  Create it first: cli.py create proto {recipient_id}")
+        return
+    
+    recipient = Capsule.from_dict(recipient_data)
+    if recipient.capsule_type != CapsuleType.PROTO:
+        print(f"Error: Recipient must be a PROTO capsule")
+        return
+    
+    slot = sender.get_slot(slot_name)
+    if not slot:
+        print(f"Error: Slot '{slot_name}' not found")
+        print(f"  Available: {', '.join(sender.slots.keys())}")
+        return
+    
+    if not slot.starter_id:
+        print(f"Error: Slot '{slot_name}' is empty")
+        return
+    
+    # Create invitation
+    invitation_id = f"inv_{sender_id}_{recipient_id}_{datetime.now().strftime('%Y%m%d%H%M%S')}"
+    invitation = {
+        'id': invitation_id,
+        'sender': sender_id,
+        'recipient': recipient_id,
+        'slot': slot_name,
+        'starter_id': slot.starter_id,
+        'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    }
+    
+    # Save invitation
+    invitations = manager.load_invitations()
+    invitations.append(invitation)
+    manager.save_invitations(invitations)
+    
+    # Record in sender's ledger
+    ledger = manager.load_ledger(sender_id)
+    event = create_invitation_event(
+        invitation_id=invitation_id,
+        sender_id=sender_id,
+        recipient_id=recipient_id,
+        starter_id=slot.starter_id,
+        capsule_id=sender_id,
+        slot_type=slot_name
+    )
+    ledger.append(event, tags=["invitation", "outgoing"])
+    manager.save_ledger(sender_id, ledger)
+    
+    print(f"\n📤 INVITATION SENT:")
+    print(f"  From: {sender_id} (GENESIS)")
+    print(f"  To: {recipient_id} (PROTO)")
+    print(f"  Starter: {slot_name}")
+    print(f"  Invitation ID: {invitation_id}")
+    print(f"\n💡 {recipient_id} can accept with:")
+    print(f"    cli.py accept {invitation_id}")
+
+
+def accept_invitation(capsule_id: str, invitation_id: str, manager: CapsuleManager) -> None:
+    """Accept invitation (Proto only)."""
+    capsule_data = manager.load_capsule(capsule_id)
+    if not capsule_data:
+        print(f"Error: Capsule '{capsule_id}' not found")
+        return
+    
+    capsule = Capsule.from_dict(capsule_data)
+    if capsule.capsule_type != CapsuleType.PROTO:
+        print(f"Error: Only PROTO capsules can accept invitations")
+        return
+    
+    invitations = manager.load_invitations()
+    invitation = next((inv for inv in invitations if inv['id'] == invitation_id), None)
+    
+    if not invitation:
+        print(f"Error: Invitation '{invitation_id}' not found")
+        return
+    
+    if invitation['recipient'] != capsule_id:
+        print(f"Error: Invitation is for {invitation['recipient']}, not {capsule_id}")
+        return
+    
+    slot_name = invitation['slot']
+    slot = capsule.get_slot(slot_name)
+    if not slot:
+        print(f"Error: Slot '{slot_name}' not found")
+        return
+    
+    if slot.starter_id:
+        print(f"Error: Slot '{slot_name}' is already occupied")
+        return
+    
+    # Accept invitation
+    slot.starter_id = invitation['starter_id']
+    
+    # Save updated capsule
+    manager.save_capsule(capsule_id, capsule.to_dict())
+    
+    # Record in ledger
+    ledger = manager.load_ledger(capsule_id)
+    event = Event(event_type="invitation_accepted")
+    event.metadata.update({
+        "invitation_id": invitation_id,
+        "sender": invitation['sender'],
+        "slot": slot_name,
+        "new_starter_id": slot.starter_id
+    })
+    ledger.append(event, tags=["invitation", "accepted"])
+    manager.save_ledger(capsule_id, ledger)
+    
+    # Remove invitation
+    invitations = [inv for inv in invitations if inv['id'] != invitation_id]
+    manager.save_invitations(invitations)
+    
+    print(f"\n✅ INVITATION ACCEPTED:")
+    print(f"  By: {capsule_id} (PROTO)")
+    print(f"  From: {invitation['sender']} (GENESIS)")
+    print(f"  Starter: {slot_name}")
+    print(f"  Starter ID: {slot.starter_id[:12]}...")
+    print(f"\n🎉 {capsule_id} now has {slot_name} starter!")
+
+
+def show_invitations(capsule_id: str, manager: CapsuleManager) -> None:
+    """Show pending invitations for capsule."""
+    invitations = manager.load_invitations()
+    my_invitations = [inv for inv in invitations if inv['recipient'] == capsule_id]
+    
+    if not my_invitations:
+        print(f"\n📭 No pending invitations for {capsule_id}")
+        return
+    
+    print(f"\n📥 PENDING INVITATIONS for {capsule_id}:")
+    print("-" * 50)
+    
+    for i, inv in enumerate(my_invitations, 1):
+        print(f"\n{i}. ID: {inv['id']}")
+        print(f"   From: {inv['sender']}")
+        print(f"   Starter: {inv['slot']}")
+        print(f"   Sent: {inv['timestamp']}")
+        print(f"   Accept: cli.py accept {inv['id']}")
+
 
 def main():
-    """Main CLI loop"""
-    system = CapsuleSystem()
+    parser = argparse.ArgumentParser(
+        description="Hivra CapsuleNet V1 - Genesis sends, Proto receives",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Create capsules
+  %(prog)s create genesis alice
+  %(prog)s create proto bob
+  
+  # List capsules
+  %(prog)s list
+  
+  # Load capsule (sets as current)
+  %(prog)s load alice
+  
+  # Send invitation (Genesis only)
+  %(prog)s invite bob "⚡ Juice"
+  
+  # Show/accept invitations (Proto only)
+  %(prog)s load bob
+  %(prog)s invitations
+  %(prog)s accept <invitation-id>
+  
+  # Show current capsule status
+  %(prog)s status
+        """
+    )
     
-    # Setup autocompletion
-    commands = [
-        "help", "create", "status", "add-starter", 
-        "invite", "accept", "trust", "list", "exit"
-    ]
+    subparsers = parser.add_subparsers(dest="command", help="Command")
     
-    completer = HistoryCompleter(commands)
-    readline.set_completer(completer.complete)
-    readline.parse_and_bind("tab: complete")
+    # Create
+    create_p = subparsers.add_parser("create", help="Create capsule")
+    create_p.add_argument("type", choices=["genesis", "proto"])
+    create_p.add_argument("id", help="Capsule ID")
     
-    print("Hivra Network CLI (Press Tab for auto-completion)")
-    print("Type 'help' for commands, 'exit' to quit\n")
+    # Load
+    load_p = subparsers.add_parser("load", help="Load capsule as current")
+    load_p.add_argument("id", help="Capsule ID")
     
-    while True:
-        try:
-            cmd = input("hivra> ").strip()
-            if not cmd:
-                continue
-            
-            parts = cmd.split()
-            command = parts[0]
-            
-            if command == "help":
-                print_help()
-            
-            elif command == "create":
-                if len(parts) < 2:
-                    print("Usage: create <id> [type]")
-                    continue
-                
-                capsule_id = parts[1]
-                capsule_type = CapsuleType.PROTO
-                if len(parts) > 2:
-                    try:
-                        capsule_type = CapsuleType(parts[2].lower())
-                    except ValueError:
-                        print(f"Invalid type. Use: {[t.value for t in CapsuleType]}")
-                        continue
-                
-                system.create_capsule(capsule_id, capsule_type)
-                print(f"Created capsule {capsule_id} ({capsule_type.value})")
-            
-            elif command == "list":
-                capsules = system.list_capsules()
-                if not capsules:
-                    print("No capsules created")
-                else:
-                    print("Capsules:")
-                    for cid in capsules:
-                        capsule = system.capsules[cid]
-                        print(f"  {cid} ({capsule.capsule_type.value})")
-            
-            elif command == "status":
-                if len(parts) < 2:
-                    print("Usage: status <capsule_id>")
-                    continue
-                
-                try:
-                    status = system.get_status(parts[1])
-                    print(json.dumps(status, indent=2))
-                except ValueError as e:
-                    print(f"Error: {e}")
-            
-            elif command == "add-starter":
-                if len(parts) < 2:
-                    print("Usage: add-starter <capsule_id>")
-                    continue
-                
-                try:
-                    starter_id = system.add_starter_to_capsule(parts[1])
-                    print(f"Added starter {starter_id} to {parts[1]}")
-                except ValueError as e:
-                    print(f"Error: {e}")
-            
-            elif command == "invite":
-                if len(parts) < 4:
-                    print("Usage: invite <from_id> <to_id> <starter_id>")
-                    continue
-                
-                try:
-                    system.send_invite(parts[1], parts[2], parts[3])
-                    print(f"Invitation sent from {parts[1]} to {parts[2]}")
-                except ValueError as e:
-                    print(f"Error: {e}")
-            
-            elif command == "accept":
-                if len(parts) < 4:
-                    print("Usage: accept <capsule_id> <from_id> <starter_id>")
-                    continue
-                
-                try:
-                    events = system.accept_invite(parts[1], parts[2], parts[3])
-                    print(f"Invitation accepted. Generated {len(events)} events")
-                except ValueError as e:
-                    print(f"Error: {e}")
-            
-            elif command == "trust":
-                if len(parts) < 3:
-                    print("Usage: trust <capsule_id> <target_id>")
-                    continue
-                
-                try:
-                    system.toggle_trust(parts[1], parts[2])
-                    print(f"Trust toggled for {parts[1]} -> {parts[2]}")
-                except ValueError as e:
-                    print(f"Error: {e}")
-            
-            elif command == "exit":
-                print("Goodbye!")
-                break
-            
-            else:
-                print(f"Unknown command: {command}. Type 'help' for commands.")
+    # Status
+    status_p = subparsers.add_parser("status", help="Show current capsule status")
+    status_p.add_argument("id", nargs="?", help="Capsule ID (optional)")
+    
+    # List
+    subparsers.add_parser("list", help="List all capsules")
+    
+    # Invite
+    invite_p = subparsers.add_parser("invite", help="Send invitation")
+    invite_p.add_argument("recipient", help="Recipient capsule ID")
+    invite_p.add_argument("slot", help='Slot type, e.g., "⚡ Juice"')
+    
+    # Accept
+    accept_p = subparsers.add_parser("accept", help="Accept invitation")
+    accept_p.add_argument("invitation_id", help="Invitation ID")
+    
+    # Invitations
+    invitations_p = subparsers.add_parser("invitations", help="Show invitations")
+    invitations_p.add_argument("id", nargs="?", help="Capsule ID (optional)")
+    
+    args = parser.parse_args()
+    
+    if not args.command:
+        parser.print_help()
+        return
+    
+    manager = CapsuleManager()
+    
+    try:
+        if args.command == "create":
+            create_capsule(args.type, args.id, manager)
         
-        except KeyboardInterrupt:
-            print("\nGoodbye!")
-            break
-        except EOFError:
-            print("\nGoodbye!")
-            break
-        except Exception as e:
-            print(f"Error: {e}")
+        elif args.command == "load":
+            load_capsule(args.id, manager)
+        
+        elif args.command == "status":
+            capsule_id = args.id or manager.get_current_capsule_id()
+            if not capsule_id:
+                print("Error: No capsule specified and no current capsule")
+                print("  Use: cli.py load <id>  or  cli.py status <id>")
+                return
+            show_status(capsule_id, manager)
+        
+        elif args.command == "list":
+            list_capsules(manager)
+        
+        elif args.command == "invite":
+            sender_id = manager.get_current_capsule_id()
+            if not sender_id:
+                print("Error: No current capsule")
+                print("  Use: cli.py load <sender-id>  first")
+                return
+            send_invitation(sender_id, args.recipient, args.slot, manager)
+        
+        elif args.command == "accept":
+            capsule_id = manager.get_current_capsule_id()
+            if not capsule_id:
+                print("Error: No current capsule")
+                print("  Use: cli.py load <your-id>  first")
+                return
+            accept_invitation(capsule_id, args.invitation_id, manager)
+        
+        elif args.command == "invitations":
+            capsule_id = args.id or manager.get_current_capsule_id()
+            if not capsule_id:
+                print("Error: No capsule specified")
+                print("  Use: cli.py invitations <id>  or  cli.py load <id> first")
+                return
+            show_invitations(capsule_id, manager)
+    
+    except KeyboardInterrupt:
+        print("\n⏹️  Cancelled")
+    except Exception as e:
+        print(f"\n❌ Error: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+
 
 if __name__ == "__main__":
     main()
